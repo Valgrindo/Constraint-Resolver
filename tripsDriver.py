@@ -1,3 +1,9 @@
+"""
+A driver for the use of role restriction in pytrips.
+
+:author: Jansen Orfan
+"""
+
 import pytrips.ontology as trips
 
 lemma = "kill"

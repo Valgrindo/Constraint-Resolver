@@ -1,3 +1,9 @@
+"""
+A patch for pytrips to allow viewing of role restrictions.
+
+:author: Jansen Orfan
+"""
+
 class TripsRestriction(object):
     def __init__(self, role, restrs, optionality, ont):
         self.__ont = ont
