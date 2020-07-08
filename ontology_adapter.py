@@ -27,19 +27,14 @@ class RestrictionType(Enum):
                 return t
         raise ValueError(f'Invalid RestrictionType {string}')
 
+    def __repr__(self):
+        return self.value
+
 
 @dataclass
 class Restriction:
     type: RestrictionType
     values: List[Union[str, Tuple[str, ...]]]
-
-    def parse(self, string: str):
-        """
-
-        :param string:
-        :return:
-        """
-        pass
 
 
 @dataclass
@@ -58,13 +53,17 @@ class Sense:
     A word sense is a name combined with a collection of roles and restrictions
     """
     name: str
-    roles: Dict[str, Role]
+    roles: Dict[str, Role]  # A mapping of semantic role slot names to corresponding information
+    features: Dict[str, str]  # A map of features of this sense
+    ancestry: List[str]  # An ascending ontological hierarchy
 
     def __repr__(self):
         return f'Sense(name="{self.name}")'
 
 
 class OntologyAdapter:
+
+    _ROOT = 'ont::root'
 
     def __init__(self):
         """
@@ -85,6 +84,7 @@ class OntologyAdapter:
             name = str(t)
             roles = {}
 
+            # Capture information about roles
             for r in t.arguments:
                 role = r.role
                 optional = r.optionality
@@ -96,7 +96,17 @@ class OntologyAdapter:
 
                 roles[role] = Role(role, optional, restrictions)
 
-            sense = Sense(name, roles)
+            # Copy the features over
+            features = {k: v for k, v in t.sem.features.items()}
+
+            # Compute complete ancestry
+            ancestry = []
+            cursor = t
+            while cursor.parent != OntologyAdapter._ROOT:
+                ancestry.append(cursor.parent)
+                cursor = cursor.parent
+
+            sense = Sense(name, roles, features, ancestry)
             senses.append(sense)
 
         return senses
