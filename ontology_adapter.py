@@ -33,8 +33,14 @@ class RestrictionType(Enum):
 
 @dataclass
 class Restriction:
+    _ALL_TYPES = 'type'
+
     type: RestrictionType
     values: List[Union[str, Tuple[str, ...]]]
+
+    @property
+    def wildcard(self):
+        return self.values == Restriction._ALL_TYPES
 
 
 @dataclass
@@ -45,6 +51,9 @@ class Role:
     role: str
     optional: bool
     restrictions: List[Restriction]
+
+    def is_specific(self):
+        return not any(r.wildcard for r in self.restrictions)
 
 
 @dataclass
@@ -87,7 +96,7 @@ class OntologyAdapter:
             # Capture information about roles
             for r in t.arguments:
                 role = r.role
-                optional = r.optionality
+                optional = r.optionality != 'REQUIRED'
 
                 restrictions = []
                 for raw in r.getRawRestrictions():
@@ -103,7 +112,7 @@ class OntologyAdapter:
             ancestry = []
             cursor = t
             while cursor.parent != OntologyAdapter._ROOT:
-                ancestry.append(cursor.parent)
+                ancestry.append(cursor.parent.name.replace('-object', '-obj'))
                 cursor = cursor.parent
 
             sense = Sense(name, roles, features, ancestry)

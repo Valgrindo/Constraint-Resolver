@@ -13,7 +13,7 @@ from trips_parser import TripsAPI
 from logical_form import LogicalForm
 from typing import *
 
-from ontology_adapter import OntologyAdapter, Sense, Restriction
+from ontology_adapter import OntologyAdapter, Sense, Restriction, RestrictionType
 
 MAX_ID_RANGE = 1000
 
@@ -42,18 +42,21 @@ Relation = Union[T_Var, Tuple[T_Var, T_Var]]
 # A binding is an assignment of a type variable to a concrete sense
 Binding = Tuple[T_Var, str]
 
+# An assignment of one type var with all corresponding matching assignments of another.
+Assignment = Tuple[Binding, T_Var, List[str]]
+
 
 class Resolver:
     """
     A collection of state and behaviors for a semantic resolver.
     """
-    _T_VAR_ID = 0
 
     def __init__(self):
         self.relations = set()  # type: Set[Relation]
         self.senses = {}  # type: Dict[T_Var, List[Sense]]
         #  A mapping of (type var, sense) pairs to
-        self.bindings = {}  # type: Dict[Binding, Dict[T_Var, List[str]]]
+        self.bindings = {}  # type: Dict[Binding, Dict[str, List[Binding]]]
+        self.__seen_components = set()
 
         self._adapter = OntologyAdapter()
         self._api = TripsAPI()
@@ -65,6 +68,7 @@ class Resolver:
         """
         self.relations = set()
         self.senses = {}
+        self.__seen_components = set()
 
     def resolve(self, sentence: str, mode: ResolveType, count: int = None):
         """
@@ -72,7 +76,7 @@ class Resolver:
         :param sentence: The sentence to resolve.
         :param mode: STRICT or FUZZY resolution.
         :param count: The number of interpretations to show.
-        :return: A list of tagged interpretations.
+        :return: A list of assignments and a success indicator.
         """
         self._reset()
 
@@ -82,21 +86,15 @@ class Resolver:
 
         # 2) Obtain a set of unary and binary relations represented in the logical form
         self._get_relations_and_senses(lf)  # Stored in the Resolver's state
+        for t_var, senses in self.senses.items():
+            if not senses:
+                print(f'No senses found for {t_var}')
 
         # 3) Check the constraints imposed by those relations against the selectional restrictions. Discard any invalid
         # interpretations and store the valid ones.
-        self._satisfy_constraints(mode)
+        bad_roles = self._satisfy_constraints(mode)
 
-        assignments = []
-        # Create a set of annotated sentences using generated bindings.
-        # The top level of the dictionary is the left hand side of binary relations.
-        for key, matches in self.bindings.items():
-            # The nested dictionary is the right hand side of binary relations.
-            for t_var, senses in matches.items():
-                # The list of senses is all the right-hand senses that make the relation valid for a set left-hand side.
-                assignments.append((key, t_var, senses))
-
-        return assignments
+        return self.bindings, bad_roles
 
     def _get_relations_and_senses(self, lf: LogicalForm):
         """
@@ -124,6 +122,10 @@ class Resolver:
         if isinstance(comp, str) or (not comp.word and not comp.roles[0]):
             return
 
+        if comp in self.__seen_components:
+            return
+        self.__seen_components.add(comp)
+
         t_var = None
         # If this component represents a word, create a unique type variable and a unary relation.
         if comp.word:
@@ -146,7 +148,7 @@ class Resolver:
             # Finally, recurse on the child
             self.__rel_rest_help(child)
 
-    def _satisfy_constraints(self, mode: ResolveType) -> NoReturn:
+    def _satisfy_constraints(self, mode: ResolveType) -> Set[Tuple[Binding, str]]:
         """
         Given a set of relations between type variables and a set of type variable senses/constraints, generate all
         satisfying assignments of senses.
@@ -157,53 +159,94 @@ class Resolver:
         if mode is ResolveType.FUZZY:
             raise NotImplementedError('Fuzzy matching not yet supported.')
 
-        # For all relations in the sentence:
+        # Relations must be considered in groups of matching left-hand side
+        # For example, if there are relations (V1, V2), (V1, V3), (V1, V4), then a satisfactory assignment is one where
+        # All required and any optional roles of V1 are occupied by some combination of V2, V3, and V4
+        groups = {}
+        unsatisfied_roles = set()
         for rel in self.relations:
             if not isinstance(rel, tuple):
-                # No work needs to be done for unary relations, skip them.
                 continue
+            v1, v2 = rel
+            if v1 not in groups:
+                groups[v1] = []
+            groups[v1].append(v2)
 
-            v1, v2 = rel  # Unpack the relation
-            v1_senses, v2_senses = self.senses[v1], self.senses[v2]
+        for parent, children in groups.items():
+            # We must find all combinations of children that fill required slots on the parent.
+            p_senses = self.senses[parent]
 
-            # The core of the problem is to find an assignment of senses for each binary relation such that
-            # the selectional restrictions imposed by the sense of the first type var match the second type var
-            # For each type var, senses that are not allowable are removed. If a type var is ever found to be with an
-            # empty set of senses, the match is a failure.
-            for sense in v1_senses:
-                # The relation is valid if, for some sense s in v1 there exists a role r such that the restrictions on
-                # r match the features of some sense s2 in v2
-                for role in sense.roles.values():
-                    # Examine all senses of v2 until we find something that fits this role
-                    matches = list(filter(lambda s: self.matches_restrictions(s, role.restrictions), v2_senses))
+            # For every sense of the parent
+            for p_sense in p_senses:
+                # Gather all roles with specific restrictions
+                relevant_roles = list(filter(lambda r: r.is_specific(), p_sense.roles.values()))
+                key = (parent, p_sense.name)
+                if key not in self.bindings:
+                    self.bindings[key] = {}
 
-                    # If the role is required and could not be matched up to a sense, then there is no valid
-                    # interpretation.
-                    if not role.optional and not matches:
-                        options = "\n\t".join([s.name for s in v2_senses])
-                        raise ValueError(f'Could not match required role {v1}.{sense.name}.{role.role} to any {v2} '
-                                         f'sense:{options}')
+                # For every role with restrictions on the parent
+                for r in relevant_roles:
+                    # For every right-hand-side child
+                    fitting_children = []
+                    for c in children:
+                        c_senses = self.senses[c]
+                        # Get all the child's senses that fit the role
+                        matches = list(filter(lambda s: self.matches_restrictions(s, r.restrictions), c_senses))
+                        fitting_children.extend((c, s.name) for s in matches)
 
-                    # The above list contains the senses of v2 that can be paired with the current sense of v1
-                    # Form Bindings out of all combinations of (v1, v2)
-                    key = (v1, sense.name)
-                    if key not in self.bindings:
-                        self.bindings[key] = {}
+                    if not r.optional and not fitting_children:
+                        unsatisfied_roles.add((key, r.role))
 
-                    if v2 not in self.bindings[key] and matches:
-                        self.bindings[key][v2] = []
-                    self.bindings[key][v2].extend([s.name for s in matches])
+                    if r.role not in self.bindings[key]:
+                        self.bindings[key][r.role] = []
+                    self.bindings[(parent, p_sense.name)][r.role].extend(fitting_children)
+
+                # There were no wildcard or required roles on a sense and all of them are unsatisfied, then so is the
+                # sense
+                if len(self.bindings[(parent, p_sense.name)]) == len(p_sense.roles):
+                    if all(not matches for _, matches in self.bindings[(parent, p_sense.name)].items()):
+                        unsatisfied_roles.add(((parent, p_sense.name), 'ALL'))
 
         # Once all relations have been examined, we have a complete set of allowable bindings.
+        return unsatisfied_roles
 
-    def matches_restrictions(self, s: Sense, rs: List[Restriction]) -> bool:
+    @staticmethod
+    def matches_restrictions(s: Sense, rs: List[Restriction]) -> bool:
         """
         Test whether the given sense matches a provided list of restrictions.
         :param s: A Sense to match
         :param rs: Restrictions to match against
         :return: True if the Sense satisfies the Restrictions, False otherwise.
         """
-        return True  # TODO: Implement
+        # The sense matches restrictions if every individual restriction is satisfied.
+        for r in rs:
+            if r.type in [RestrictionType.TYPE, RestrictionType.TYPEQ]:
+                # The type of this sense must match at least one within the restriction list.
+                # The type does not have to match exactly. A matching ancestor is acceptable.
+                # For example, if the restriction calls for a phys-obj and the sense is a car, it passes.
+
+                # Trips uses a 'type' constant to indicate a wildcard, matching anything
+                if r.wildcard:
+                    continue
+
+                anc_overlap = list(filter(lambda x: x in r.values, s.ancestry))
+                if (s.name not in r.values) and (not anc_overlap):
+                    # Neither this sense nor its ancestry matched up to the restriction.
+                    return False
+            elif r.type is RestrictionType.FEATURES:
+                # The set of features represented in the restriction must be a proper subset of sense features.
+                for f_name, f_val in r.values:
+                    if not isinstance(f_val, str):
+                        continue
+                    if f_name not in s.features:
+                        # A required feature is missing
+                        return False
+                    if s.features[f_name].lower() != f_val.lower():
+                        # Value mismatch for required feature.
+                        return False
+
+        # Made it to the end with no failures ==> Match
+        return True
 
     @staticmethod
     def get_tvar(comp):
@@ -226,28 +269,34 @@ def main():
     argp.add_argument("-m", "--mode", choices=[t.value for t in ResolveType], required=True, type=str,
                       help="Strictness of the algorithm.\n\tstrict\tRequires all semantic restrictions to match.\n"
                            "fuzzy\tAllows for some mismatch. Shows 'n' least mismatching interpretations.")
-    argp.add_argument("-n", "--number", type=int, help="The number of interpretations to show. Required for fuzzy mode.")
     args = argp.parse_args()
     args.mode = ResolveType.parse(args.mode)  # The IDE warning is lying
 
-    if args.number is None and args.mode == ResolveType.FUZZY:
-        print(f'Argument -n is required for {ResolveType.FUZZY.value} mode.')
-        exit(1)
-
-    if args.number is not None:
-        if args.number < 1:
-            print(f'Argument -n cannot be less than 1.')
-            exit(1)
-
-    to_show = 'all' if args.number is None else args.number
-    print(f'Resolving sentence: {args.sentence}\nMode: {args.mode.value}\n\nShowing {to_show} results:')
+    print(f'Resolving sentence: {args.sentence}\nMode: {args.mode.value}')
 
     resolver = Resolver()
-    interpretations = resolver.resolve(args.sentence, args.mode, args.number)
+    bindings, errors = resolver.resolve(args.sentence, args.mode)
 
-    # Display all returned interpretations
-    for i in interpretations:
-        print(i)
+    if errors:
+        print('Failed to find a satisfying assignment for the following senses:')
+        for e in errors:
+            print(e)
+            # Remove invalid senses from the result set
+            del bindings[e[0]]
+
+    print('\nSatisfying bindings:')
+    # Display all returned bindings
+    for binding, roles in bindings.items():
+        print(binding)
+        impossible_roles = []
+        for role, assignments in roles.items():
+            if not assignments:
+                impossible_roles.append(role)
+            else:
+                print(f'\t{role} -> [{", ".join([f"({a[0]}, {a[1]})" for a in assignments])}]')
+        if impossible_roles:
+            print(f'\tUnsatisfiable roles: {impossible_roles}')
+        print(f'\tANY sense of other components for all other roles')
 
 
 if __name__ == '__main__':
