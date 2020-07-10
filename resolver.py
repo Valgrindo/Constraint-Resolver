@@ -282,7 +282,8 @@ def main():
         for e in errors:
             print(e)
             # Remove invalid senses from the result set
-            del bindings[e[0]]
+            if e[0] in bindings:
+                del bindings[e[0]]
 
     print('\nSatisfying bindings:')
     # Display all returned bindings
